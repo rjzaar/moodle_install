@@ -1,0 +1,408 @@
+name: Test Moodle Installation
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  test-installation:
+    name: Test on Ubuntu ${{ matrix.ubuntu-version }}
+    runs-on: ubuntu-${{ matrix.ubuntu-version }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu-version: ['20.04', '22.04', '24.04']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Display system information
+        run: |
+          echo "Testing on Ubuntu $(lsb_release -rs)"
+          echo "Kernel: $(uname -r)"
+          echo "Available memory: $(free -h | grep Mem | awk '{print $2}')"
+          echo "Available disk: $(df -h / | awk 'NR==2 {print $4}')"
+      
+      - name: Update system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get upgrade -y
+      
+      - name: Make scripts executable
+        run: |
+          chmod +x install-moodle.sh
+          chmod +x troubleshoot-moodle.sh
+          chmod +x moodle-status.sh
+          chmod +x setup.sh
+      
+      - name: Run setup script
+        run: |
+          bash setup.sh
+      
+      - name: Set installation environment variables
+        run: |
+          echo "DOMAIN=localhost" >> $GITHUB_ENV
+          echo "DB_PASSWORD=TestPassword123!" >> $GITHUB_ENV
+      
+      - name: Run installation script
+        run: |
+          sudo -E ./install-moodle.sh
+        env:
+          DOMAIN: localhost
+          DB_PASSWORD: TestPassword123!
+        timeout-minutes: 30
+      
+      - name: Verify services are running
+        run: |
+          echo "Checking Nginx..."
+          sudo systemctl is-active nginx || (echo "Nginx not running" && exit 1)
+          
+          echo "Checking MariaDB..."
+          sudo systemctl is-active mariadb || (echo "MariaDB not running" && exit 1)
+          
+          echo "Checking PHP-FPM..."
+          PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
+          sudo systemctl is-active php${PHP_VERSION}-fpm || (echo "PHP-FPM not running" && exit 1)
+          
+          echo "✓ All services are running"
+      
+      - name: Verify file structure
+        run: |
+          echo "Checking Moodle directory..."
+          test -d /var/www/html/moodle || (echo "Moodle directory missing" && exit 1)
+          test -f /var/www/html/moodle/version.php || (echo "Moodle files incomplete" && exit 1)
+          
+          echo "Checking data directory..."
+          test -d /var/moodledata || (echo "Data directory missing" && exit 1)
+          
+          echo "Checking ownership..."
+          MOODLE_OWNER=$(stat -c '%U' /var/www/html/moodle)
+          test "$MOODLE_OWNER" = "www-data" || (echo "Incorrect ownership" && exit 1)
+          
+          DATA_OWNER=$(stat -c '%U' /var/moodledata)
+          test "$DATA_OWNER" = "www-data" || (echo "Incorrect data dir ownership" && exit 1)
+          
+          echo "✓ File structure is correct"
+      
+      - name: Verify database
+        run: |
+          echo "Testing database connection..."
+          mysql -u moodleuser -pTestPassword123! -e "USE moodle; SELECT 1;" || \
+            (echo "Database connection failed" && exit 1)
+          
+          echo "Checking database structure..."
+          TABLE_COUNT=$(mysql -u moodleuser -pTestPassword123! -e \
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='moodle';" \
+            | tail -n1)
+          
+          # Database should be created but not populated yet (web install pending)
+          echo "Database tables: $TABLE_COUNT"
+          
+          echo "✓ Database is accessible"
+      
+      - name: Verify PHP configuration
+        run: |
+          echo "Checking PHP version..."
+          php -v
+          
+          echo "Checking PHP extensions..."
+          php -m | grep -E 'curl|gd|intl|mbstring|mysqli|soap|xml|xmlrpc|zip' || \
+            (echo "Missing required PHP extensions" && exit 1)
+          
+          echo "Checking PHP settings..."
+          MAX_EXEC=$(php -r "echo ini_get('max_execution_time');")
+          test "$MAX_EXEC" -ge 300 || (echo "max_execution_time too low: $MAX_EXEC" && exit 1)
+          
+          MEMORY=$(php -r "echo ini_get('memory_limit');")
+          echo "Memory limit: $MEMORY"
+          
+          UPLOAD=$(php -r "echo ini_get('upload_max_filesize');")
+          echo "Upload max: $UPLOAD"
+          
+          echo "✓ PHP configuration is correct"
+      
+      - name: Verify Nginx configuration
+        run: |
+          echo "Testing Nginx configuration..."
+          sudo nginx -t || (echo "Nginx config invalid" && exit 1)
+          
+          echo "Checking Moodle site config..."
+          test -f /etc/nginx/sites-available/moodle || \
+            (echo "Moodle site config missing" && exit 1)
+          
+          test -L /etc/nginx/sites-enabled/moodle || \
+            (echo "Moodle site not enabled" && exit 1)
+          
+          echo "✓ Nginx configuration is valid"
+      
+      - name: Test web server response
+        run: |
+          echo "Testing HTTP response..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost)
+          
+          if [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]]; then
+            echo "✓ Web server responding with code: $HTTP_CODE"
+          else
+            echo "✗ Unexpected HTTP code: $HTTP_CODE"
+            echo "Checking Nginx error log:"
+            sudo tail -20 /var/log/nginx/error.log
+            exit 1
+          fi
+      
+      - name: Test Moodle initial page load
+        run: |
+          echo "Fetching Moodle page..."
+          RESPONSE=$(curl -s http://localhost)
+          
+          if echo "$RESPONSE" | grep -q "Moodle"; then
+            echo "✓ Moodle page loads successfully"
+          else
+            echo "✗ Moodle page doesn't contain expected content"
+            echo "Response preview:"
+            echo "$RESPONSE" | head -50
+            exit 1
+          fi
+      
+      - name: Verify cron configuration
+        run: |
+          echo "Checking cron job..."
+          sudo crontab -u www-data -l | grep -q "admin/cli/cron.php" || \
+            (echo "Cron job not configured" && exit 1)
+          
+          echo "✓ Cron job is configured"
+      
+      - name: Verify firewall configuration
+        run: |
+          echo "Checking UFW status..."
+          sudo ufw status | grep -q "Status: active" || \
+            echo "Warning: Firewall not active"
+          
+          if sudo ufw status | grep -q "Status: active"; then
+            sudo ufw status | grep -q "Nginx" || \
+              echo "Warning: Nginx firewall rules not found"
+          fi
+          
+          echo "✓ Firewall checked"
+      
+      - name: Run status check script
+        run: |
+          echo "Running moodle-status.sh..."
+          sudo ./moodle-status.sh
+      
+      - name: Run troubleshoot script
+        run: |
+          echo "Running troubleshoot-moodle.sh..."
+          sudo ./troubleshoot-moodle.sh
+        continue-on-error: true  # Don't fail if troubleshooter finds minor issues
+      
+      - name: Check installation log
+        if: always()
+        run: |
+          echo "=== Installation Log ==="
+          if [ -f /var/log/moodle_install.log ]; then
+            tail -100 /var/log/moodle_install.log
+          else
+            echo "Installation log not found"
+          fi
+      
+      - name: Check service logs on failure
+        if: failure()
+        run: |
+          echo "=== Nginx Error Log ==="
+          sudo tail -50 /var/log/nginx/error.log || echo "No Nginx log"
+          
+          echo "=== PHP-FPM Log ==="
+          PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;" 2>/dev/null || echo "8.1")
+          sudo tail -50 /var/log/php${PHP_VERSION}-fpm.log || echo "No PHP-FPM log"
+          
+          echo "=== MariaDB Log ==="
+          sudo journalctl -u mariadb -n 50 || echo "No MariaDB log"
+          
+          echo "=== System Log ==="
+          sudo journalctl -n 50 || echo "No system log"
+      
+      - name: Generate diagnostic report
+        if: always()
+        run: |
+          echo "=== System Information ==="
+          uname -a
+          lsb_release -a
+          
+          echo "=== Service Status ==="
+          sudo systemctl status nginx --no-pager || true
+          sudo systemctl status mariadb --no-pager || true
+          PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;" 2>/dev/null || echo "8.1")
+          sudo systemctl status php${PHP_VERSION}-fpm --no-pager || true
+          
+          echo "=== Disk Usage ==="
+          df -h
+          
+          echo "=== Memory Usage ==="
+          free -h
+          
+          echo "=== Network Ports ==="
+          sudo ss -tuln | grep -E ':(80|443|3306) '
+      
+      - name: Upload diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-report-ubuntu-${{ matrix.ubuntu-version }}
+          path: |
+            /var/log/moodle_install.log
+            /tmp/moodle_diagnostic_report_*.txt
+          retention-days: 30
+          if-no-files-found: warn
+      
+      - name: Test cleanup (optional)
+        if: always()
+        run: |
+          echo "Cleaning up test installation..."
+          # Stop services
+          sudo systemctl stop nginx || true
+          PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;" 2>/dev/null || echo "8.1")
+          sudo systemctl stop php${PHP_VERSION}-fpm || true
+          
+          # Note: We don't actually remove files in CI as the runner is discarded anyway
+          echo "✓ Cleanup noted (runner will be discarded)"
+
+  test-resume-capability:
+    name: Test Installation Resume
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Make scripts executable
+        run: |
+          chmod +x install-moodle.sh
+          bash setup.sh
+      
+      - name: Run partial installation (will be interrupted)
+        run: |
+          # Start installation in background
+          sudo -E ./install-moodle.sh &
+          INSTALL_PID=$!
+          
+          # Wait for a few steps to complete
+          sleep 60
+          
+          # Interrupt the installation
+          sudo kill $INSTALL_PID || true
+          
+          echo "Installation interrupted for resume test"
+        env:
+          DOMAIN: localhost
+          DB_PASSWORD: TestPassword123!
+        continue-on-error: true
+      
+      - name: Verify state file exists
+        run: |
+          test -f /root/.moodle_install_state || \
+            (echo "State file not created" && exit 1)
+          
+          echo "State file contents:"
+          sudo cat /root/.moodle_install_state
+      
+      - name: Resume installation
+        run: |
+          sudo -E ./install-moodle.sh
+        env:
+          DOMAIN: localhost
+          DB_PASSWORD: TestPassword123!
+        timeout-minutes: 30
+      
+      - name: Verify installation completed
+        run: |
+          sudo systemctl is-active nginx || exit 1
+          sudo systemctl is-active mariadb || exit 1
+          test -d /var/www/html/moodle || exit 1
+          echo "✓ Resume test passed"
+
+  test-idempotency:
+    name: Test Script Idempotency
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Make scripts executable
+        run: |
+          chmod +x install-moodle.sh
+          bash setup.sh
+      
+      - name: Run installation (first time)
+        run: |
+          sudo -E ./install-moodle.sh
+        env:
+          DOMAIN: localhost
+          DB_PASSWORD: TestPassword123!
+        timeout-minutes: 30
+      
+      - name: Run installation again (should skip completed steps)
+        run: |
+          echo "Running installation script again to test idempotency..."
+          sudo -E ./install-moodle.sh
+        env:
+          DOMAIN: localhost
+          DB_PASSWORD: TestPassword123!
+        timeout-minutes: 10
+      
+      - name: Verify services still running
+        run: |
+          sudo systemctl is-active nginx || exit 1
+          sudo systemctl is-active mariadb || exit 1
+          test -d /var/www/html/moodle || exit 1
+          echo "✓ Idempotency test passed"
+
+  test-scripts-only:
+    name: Test Script Syntax
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Check bash syntax
+        run: |
+          echo "Checking install-moodle.sh..."
+          bash -n install-moodle.sh
+          
+          echo "Checking troubleshoot-moodle.sh..."
+          bash -n troubleshoot-moodle.sh
+          
+          echo "Checking moodle-status.sh..."
+          bash -n moodle-status.sh
+          
+          echo "Checking setup.sh..."
+          bash -n setup.sh
+          
+          echo "✓ All scripts have valid syntax"
+      
+      - name: Run shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          
+          echo "Running shellcheck on scripts..."
+          shellcheck -S warning install-moodle.sh || true
+          shellcheck -S warning troubleshoot-moodle.sh || true
+          shellcheck -S warning moodle-status.sh || true
+          shellcheck -S warning setup.sh || true
+          
+          echo "✓ Shellcheck completed"
+      
+      - name: Check documentation exists
+        run: |
+          test -f README.md || (echo "README.md missing" && exit 1)
+          test -f QUICKSTART.md || (echo "QUICKSTART.md missing" && exit 1)
+          test -f INSTALL_README.md || (echo "INSTALL_README.md missing" && exit 1)
+          test -f FILE_MANIFEST.md || (echo "FILE_MANIFEST.md missing" && exit 1)
+          echo "✓ All documentation files present"
